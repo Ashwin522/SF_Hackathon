@@ -1,0 +1,41 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# API Keys (IMPORTANT - Never commit these!)
+*.env
+.env
+set_groq_key.sh
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+full_simulation.log
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Data files
+*.csv
+*.json
+defense_positions.csv
+
+# OpenAPI spec (not needed for main project)
+/Users/ashwinnair/Downloads/openapi.yaml
