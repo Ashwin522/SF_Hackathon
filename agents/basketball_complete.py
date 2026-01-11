@@ -11,10 +11,14 @@ import os
 import requests
 import gymnasium as gym
 from gymnasium import spaces
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from threading import Thread
 import queue
 import time
+import argparse
+import json
+import csv
+import random
 
 
 # ============================================================================
@@ -521,8 +525,81 @@ class DefenseComparator:
 
 
 # ============================================================================
-# PART 5: REAL-TIME SIMULATION WITH VISUALIZATION
+    # PART 5: REAL-TIME SIMULATION WITH VISUALIZATION
 # ============================================================================
+
+def load_custom_frames(path: str) -> List[Dict]:
+    """Load custom coordinate frames from JSON or CSV.
+
+    JSON schema (list of frames):
+    [
+      {"frame":0, "possession":0, "ball":{"x":12.0,"y":25.0},
+       "team1":[{"id":1,"x":..,"y":..},...,{"id":5,...}],
+       "team2":[{"id":1,"x":..,"y":..},...,{"id":5,...}]}, ...]
+
+    CSV columns required:
+      frame,possession,ball_x,ball_y,
+      t1p1_x,t1p1_y,...,t1p5_x,t1p5_y,
+      t2p1_x,t2p1_y,...,t2p5_x,t2p5_y
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Custom data file not found: {path}")
+
+    _, ext = os.path.splitext(path)
+    ext = ext.lower()
+    frames: List[Dict] = []
+
+    if ext in (".json", ".jsonl"):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("JSON must be a list of frame objects")
+        for i, item in enumerate(data):
+            possession = int(item.get("possession", 0))
+            ball = item.get("ball", {})
+            bx = float(ball.get("x", 50))
+            by = float(ball.get("y", 25))
+            t1 = item.get("team1", [])
+            t2 = item.get("team2", [])
+            if len(t1) != 5 or len(t2) != 5:
+                raise ValueError("Each frame must have 5 players for team1 and team2")
+            frames.append({
+                "frame": int(item.get("frame", i)),
+                "possession": possession,
+                "ball_x": bx,
+                "ball_y": by,
+                "team1": [{"id": int(p.get("id", idx+1)), "x": float(p["x"]), "y": float(p["y"]) } for idx, p in enumerate(t1)],
+                "team2": [{"id": int(p.get("id", idx+1)), "x": float(p["x"]), "y": float(p["y"]) } for idx, p in enumerate(t2)],
+            })
+    elif ext == ".csv":
+        required = ["frame","possession","ball_x","ball_y"] 
+        required += [f"t1p{k}_{c}" for k in range(1,6) for c in ("x","y")]
+        required += [f"t2p{k}_{c}" for k in range(1,6) for c in ("x","y")]
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            header = reader.fieldnames or []
+            missing = [c for c in required if c not in header]
+            if missing:
+                raise ValueError(f"CSV missing required columns: {missing}")
+            for row in reader:
+                possession = int(float(row["possession"]))
+                bx = float(row["ball_x"]) ; by = float(row["ball_y"])
+                team1 = [] ; team2 = []
+                for k in range(1,6):
+                    team1.append({"id": k, "x": float(row[f"t1p{k}_x"]), "y": float(row[f"t1p{k}_y"])})
+                    team2.append({"id": k, "x": float(row[f"t2p{k}_x"]), "y": float(row[f"t2p{k}_y"])})
+                frames.append({
+                    "frame": int(float(row["frame"])),
+                    "possession": possession,
+                    "ball_x": bx,
+                    "ball_y": by,
+                    "team1": team1,
+                    "team2": team2,
+                })
+    else:
+        raise ValueError("Unsupported file extension. Use .json or .csv")
+
+    return frames
 
 def generate_player_positions(ball_pos, possession, frame):
     """Generate player positions with defensive status"""
@@ -584,15 +661,20 @@ def draw_basketball_court(ax):
     ax.legend(loc='upper right', fontsize=8)
 
 
-def run_simulation():
-    """Run the complete basketball simulation with visualization"""
+def run_simulation(custom_frames: Optional[List[Dict]] = None):
+    """Run the complete basketball simulation with visualization.
+
+    If custom_frames is provided, replay those frames instead of random sim.
+    """
     print("="*70)
     print("BASKETBALL SIMULATION WITH REAL-TIME TACTICAL ANALYSIS")
     print("="*70)
     print()
     
-    env = BasketballEnv()
-    obs, _ = env.reset()
+    env = None
+    if custom_frames is None:
+        env = BasketballEnv()
+        obs, _ = env.reset()
     
     fig = plt.figure(figsize=(16, 7))
     ax_court = fig.add_subplot(121)
@@ -606,20 +688,21 @@ def run_simulation():
         'running': True
     }
     
-    def run_simulation_loop():
-        """Run game simulation in background"""
-        frame = 0
-        while frame < 200:
-            action = env.action_space.sample()
-            obs, reward, done, truncated, info = env.step(action)
-            simulation_data['game_states'].append(obs)
-            frame += 1
-            if done or truncated:
-                break
-        simulation_data['running'] = False
-    
-    sim_thread = Thread(target=run_simulation_loop, daemon=True)
-    sim_thread.start()
+    if custom_frames is None:
+        def run_simulation_loop():
+            """Run game simulation in background"""
+            frame = 0
+            while frame < 200:
+                action = env.action_space.sample()
+                obs, reward, done, truncated, info = env.step(action)
+                simulation_data['game_states'].append(obs)
+                frame += 1
+                if done or truncated:
+                    break
+            simulation_data['running'] = False
+        
+        sim_thread = Thread(target=run_simulation_loop, daemon=True)
+        sim_thread.start()
     
     def update_frame(frame_idx):
         ax_court.clear()
@@ -627,7 +710,17 @@ def run_simulation():
         
         draw_basketball_court(ax_court)
         
-        if frame_idx < len(simulation_data['game_states']):
+        if custom_frames is not None and frame_idx < len(custom_frames):
+            fr = custom_frames[frame_idx]
+            possession = int(fr.get('possession', 0))
+            ball_pos = float(fr.get('ball_x', 50.0))
+            ball_y = float(fr.get('ball_y', 25.0))
+            team1_players = fr.get('team1', [])
+            team2_players = fr.get('team2', [])
+            score1 = 0
+            score2 = 0
+            time_remaining = max(0, 2400 - frame_idx * 5)
+        elif custom_frames is None and frame_idx < len(simulation_data['game_states']):
             obs = simulation_data['game_states'][frame_idx]
             score1, score2, possession, time_remaining, ball_pos = obs
             
@@ -680,9 +773,249 @@ Using Groq LLM (Llama-3.1-8b)
         
         return [ax_court, ax_info]
     
-    anim = FuncAnimation(fig, update_frame, frames=200, interval=500, 
+    total_frames = len(custom_frames) if custom_frames is not None else 200
+    anim = FuncAnimation(fig, update_frame, frames=total_frames, interval=500, 
                         repeat=False, blit=False)
     
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================================
+# PART 6: AGENTIC DEFENSE COORDINATOR
+# ============================================================================
+
+class AgentMemory:
+    """Keeps short-term scores and decisions for adaptation."""
+    def __init__(self, window: int = 15):
+        self.window = window
+        self.history: List[Dict] = []  # each: {frame, choice, score, coverage_by_strategy}
+
+    def add(self, record: Dict):
+        self.history.append(record)
+        if len(self.history) > self.window:
+            self.history.pop(0)
+
+    def last_scores(self, strategy_name: str, k: int = 10) -> List[float]:
+        vals = [h['coverage_by_strategy'].get(strategy_name) for h in self.history if 'coverage_by_strategy' in h]
+        vals = [v for v in vals if v is not None]
+        return vals[-k:]
+
+    def trend(self, strategy_name: str, k: int = 6) -> float:
+        vals = self.last_scores(strategy_name, k)
+        if len(vals) < 2:
+            return 0.0
+        # simple slope estimate
+        xs = list(range(len(vals)))
+        mean_x = sum(xs)/len(xs)
+        mean_y = sum(vals)/len(vals)
+        num = sum((x-mean_x)*(y-mean_y) for x,y in zip(xs, vals))
+        den = sum((x-mean_x)**2 for x in xs) or 1.0
+        return num/den
+
+
+class AgenticDefenseCoordinator:
+    """Agent that selects strategies to maximize coverage over time.
+
+    Modes:
+    - heuristic: pick best coverage with epsilon-greedy exploration
+    - llm: ask LLM to choose among candidates using context + recent scores
+    """
+    def __init__(self, use_llm: bool = False, epsilon: float = 0.1):
+        self.use_llm = use_llm
+        self.epsilon = epsilon
+        self.memory = AgentMemory()
+        self.llm: Optional[OpenSourceLLM] = OpenSourceLLM("groq") if use_llm else None
+
+    def select_strategy(self, frame: int, candidates: List[Dict], coverage_by: Dict[str, float]) -> Dict:
+        # Exploration
+        if not self.use_llm and random.random() < self.epsilon:
+            return random.choice(candidates)
+
+        # LLM-driven selection
+        if self.use_llm and self.llm and self.llm.api_key:
+            summary = "\n".join([f"- {c['name']}: {coverage_by.get(c['name'], 0):.1f}" for c in candidates])
+            memo_lines = []
+            for s in candidates:
+                trend = self.memory.trend(s['name'])
+                memo_lines.append(f"{s['name']} trend: {trend:+.2f}/frame")
+            memo = "\n".join(memo_lines)
+            prompt = f"""
+You are selecting a defensive strategy to maximize coverage.
+Frame {frame}. Candidate coverage now:
+{summary}
+
+Recent trends (positive means improving):
+{memo}
+
+Choose one strategy name only (exact match) that will likely improve coverage next.
+Respond with just the name.
+"""
+            try:
+                resp = self.llm._call_api(prompt)
+                name = (resp or "").strip()
+                for c in candidates:
+                    if c['name'].lower() in name.lower():
+                        return c
+            except Exception:
+                pass  # fall back to heuristic
+
+        # Heuristic: pick highest coverage; break ties by positive trend
+        best = None
+        best_score = -1e9
+        for c in candidates:
+            score = coverage_by.get(c['name'], 0.0)
+            t = self.memory.trend(c['name'])
+            score += 0.5 * t  # slight boost for improving trend
+            if score > best_score:
+                best_score = score
+                best = c
+        return best or candidates[0]
+
+
+def run_agentic_simulation(custom_frames: Optional[List[Dict]] = None, use_llm: bool = False):
+    """Run simulation where an agent chooses a defensive strategy each frame."""
+    print("="*70)
+    print("AGENTIC DEFENSE SIMULATION (objective: maximize coverage)")
+    print("="*70)
+    print()
+
+    # We will either generate frames on-the-fly (random) or use custom frames
+    env = None
+    if custom_frames is None:
+        env = BasketballEnv()
+        obs, _ = env.reset()
+
+    fig = plt.figure(figsize=(16, 7))
+    ax_court = fig.add_subplot(121)
+    ax_info = fig.add_subplot(122)
+    draw_basketball_court(ax_court)
+
+    coordinator = AgenticDefenseCoordinator(use_llm=use_llm)
+    analyzer = DefensiveStrategyAnalyzer()
+    comparator = DefenseComparator()
+
+    state = {
+        'game_states': [],
+        'frame': 0,
+        'running': True
+    }
+
+    # Background sim only if random mode
+    if custom_frames is None:
+        def sim_loop():
+            frame = 0
+            while frame < 200:
+                action = env.action_space.sample()
+                obs, reward, done, truncated, info = env.step(action)
+                state['game_states'].append(obs)
+                frame += 1
+                if done or truncated:
+                    break
+            state['running'] = False
+        Thread(target=sim_loop, daemon=True).start()
+
+    # Keep a small history window for analyzer
+    history_window = 8
+
+    def update(frame_idx):
+        ax_court.clear()
+        ax_info.clear()
+        draw_basketball_court(ax_court)
+
+        # Build current frame players and ball
+        if custom_frames is not None and frame_idx < len(custom_frames):
+            fr = custom_frames[frame_idx]
+            possession = int(fr.get('possession', 0))
+            ball_pos = float(fr.get('ball_x', 50.0))
+            ball_y = float(fr.get('ball_y', 25.0))
+            team1_players = fr.get('team1', [])
+            team2_players = fr.get('team2', [])
+            score1 = 0 ; score2 = 0
+            time_remaining = max(0, 2400 - frame_idx*5)
+        elif custom_frames is None and frame_idx < len(state['game_states']):
+            obs = state['game_states'][frame_idx]
+            score1, score2, possession, time_remaining, ball_pos = obs
+            team1_players, team2_players = generate_player_positions(ball_pos, possession, frame_idx)
+            ball_handler = team1_players[0] if possession == 0 else team2_players[0]
+            ball_y = ball_handler['y']
+        else:
+            return [ax_court, ax_info]
+
+        # Plot base players
+        for p in team1_players:
+            color = 'cyan' if possession == 0 else 'lightblue'
+            ax_court.plot(p['x'], p['y'], 'o', color=color, markersize=10)
+            ax_court.text(p['x'], p['y'], str(p['id']), ha='center', va='center', fontsize=8)
+        for p in team2_players:
+            color = 'red' if possession == 1 else 'lightcoral'
+            ax_court.plot(p['x'], p['y'], 'o', color=color, markersize=10)
+            ax_court.text(p['x'], p['y'], str(p['id']), ha='center', va='center', fontsize=8, color='white')
+        ax_court.plot(ball_pos, ball_y, 's', color='orange', markersize=9)
+
+        # Build attacking positions dict and record for analyzer history
+        if possession == 0:
+            atk_dict = {p['id']: (p['x'], p['y']) for p in team1_players}
+        else:
+            atk_dict = {p['id']: (p['x'], p['y']) for p in team2_players}
+        analyzer.attacking_positions_history.append({'frame': frame_idx, 'timestamp': frame_idx*0.5, 'positions': atk_dict})
+        if len(analyzer.attacking_positions_history) > history_window:
+            analyzer.attacking_positions_history.pop(0)
+
+        # Generate candidate strategies from recent history
+        candidates, analysis = analyzer.generate_all_strategies()
+        coverage_by = {}
+        if candidates:
+            avg_attacking = analyzer.analyze_attacking_formation().get('avg_positions', atk_dict)
+            for s in candidates:
+                coverage_by[s['name']] = comparator.calculate_coverage_score(s['positions'], avg_attacking)
+
+            chosen = coordinator.select_strategy(frame_idx, candidates, coverage_by)
+            chosen_pos = chosen['positions']
+            chosen_score = coverage_by.get(chosen['name'], 0.0)
+            coordinator.memory.add({
+                'frame': frame_idx,
+                'choice': chosen['name'],
+                'score': chosen_score,
+                'coverage_by_strategy': coverage_by
+            })
+
+            # Plot chosen defender positions as green triangles
+            for did, (dx, dy) in chosen_pos.items():
+                ax_court.plot(dx, dy, marker='^', color='green', markersize=11)
+                ax_court.text(dx, dy, f"D{did}", color='black', fontsize=8, ha='center', va='center')
+        else:
+            chosen = {'name': 'N/A'}
+            chosen_score = 0.0
+
+        if possession == 0:
+            possession_team = "Team 1 (Cyan - Attacking)"
+        else:
+            possession_team = "Team 2 (Red - Attacking)"
+
+        info_text = f"""
+FRAME: {frame_idx}
+TIME: {int(time_remaining//60):02d}:{int(time_remaining%60):02d}
+
+SCORE:
+  Team 1: {int(score1)}
+  Team 2: {int(score2)}
+
+BALL: X={ball_pos:.1f}, Y={ball_y:.1f}
+POSSESSION: {possession_team}
+
+Agent Mode: {'LLM' if use_llm else 'Heuristic'}
+Chosen Strategy: {chosen['name']}
+Coverage Now: {chosen_score:.1f}
+"""
+        ax_info.text(0.05, 0.95, info_text, transform=ax_info.transAxes,
+                     fontfamily='monospace', fontsize=9, verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        ax_info.axis('off')
+        return [ax_court, ax_info]
+
+    frames = len(custom_frames) if custom_frames is not None else 200
+    anim = FuncAnimation(fig, update, frames=frames, interval=500, repeat=False, blit=False)
     plt.tight_layout()
     plt.show()
 
@@ -692,56 +1025,62 @@ Using Groq LLM (Llama-3.1-8b)
 # ============================================================================
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--test-llm":
-            print("Testing LLM Integration...")
-            llm = OpenSourceLLM(provider="groq")
-            if llm.api_key:
-                print("✓ Groq API key found")
-                test_positions = {1: (10, 25), 2: (25, 15), 3: (25, 35), 4: (45, 20), 5: (45, 30)}
-                test_defense = {1: (15, 25), 2: (30, 18), 3: (30, 32), 4: (50, 22), 5: (50, 28)}
-                response = llm.generate_tactical_analysis(test_positions, test_defense, 10, 0)
-                print("\nLLM Response:")
-                print(response)
-            else:
-                print("✗ Groq API key not set. Set GROQ_API_KEY environment variable.")
-        
-        elif sys.argv[1] == "--analyze":
-            print("Running Defensive Strategy Analysis...")
-            analyzer = DefensiveStrategyAnalyzer()
-            
-            # Sample data
-            for i in range(10):
-                positions = {
-                    1: (8+i, 25), 2: (25, 15+i), 3: (25, 35-i), 
-                    4: (45, 20+i), 5: (45, 30-i)
-                }
-                analyzer.record_attacking_positions(i, positions)
-                time.sleep(0.5)
-            
-            strategies, analysis = analyzer.generate_all_strategies()
-            print(f"\nGenerated {len(strategies)} strategies:")
-            for idx, strategy in enumerate(strategies, 1):
-                print(f"{idx}. {strategy['name']}")
-        
-        elif sys.argv[1] == "--compare":
-            print("Running Defense Comparison...")
-            comparator = DefenseComparator()
-            
-            # Sample data
-            attacking_history = [
-                {'frame': i, 'positions': {
-                    1: (8+i, 25), 2: (25, 15), 3: (25, 35), 4: (45, 20), 5: (45, 30)
-                }} for i in range(5)
-            ]
-            actual_defense = {1: (15, 25), 2: (30, 18), 3: (30, 32), 4: (50, 22), 5: (50, 28)}
-            
-            comparator.set_attacking_positions_history(attacking_history)
-            comparator.set_actual_defense(actual_defense)
-            comparator.generate_strategies()
-            report = comparator.generate_comparison_report()
+    parser = argparse.ArgumentParser(description="Basketball Tactical Analysis System")
+    parser.add_argument("--test-llm", action="store_true", help="Test LLM integration and exit")
+    parser.add_argument("--analyze", action="store_true", help="Run defensive strategy analyzer demo and exit")
+    parser.add_argument("--compare", action="store_true", help="Run defense comparison demo and exit")
+    parser.add_argument("--from-json", type=str, help="Path to JSON file with custom coordinate frames")
+    parser.add_argument("--from-csv", type=str, help="Path to CSV file with custom coordinate frames")
+    parser.add_argument("--agent", action="store_true", help="Run agentic defense simulation (heuristic)")
+    parser.add_argument("--agent-llm", action="store_true", help="Run agentic defense simulation (LLM-guided)")
+    args = parser.parse_args()
+
+    if args.test_llm:
+        print("Testing LLM Integration...")
+        llm = OpenSourceLLM(provider="groq")
+        if llm.api_key:
+            print("✓ Groq API key found")
+            test_positions = {1: (10, 25), 2: (25, 15), 3: (25, 35), 4: (45, 20), 5: (45, 30)}
+            test_defense = {1: (15, 25), 2: (30, 18), 3: (30, 32), 4: (50, 22), 5: (50, 28)}
+            response = llm.generate_tactical_analysis(test_positions, test_defense, 10, 0)
+            print("\nLLM Response:")
+            print(response)
+        else:
+            print("✗ Groq API key not set. Set GROQ_API_KEY environment variable.")
+
+    elif args.analyze:
+        print("Running Defensive Strategy Analysis...")
+        analyzer = DefensiveStrategyAnalyzer()
+        for i in range(10):
+            positions = {1: (8+i, 25), 2: (25, 15+i), 3: (25, 35-i), 4: (45, 20+i), 5: (45, 30-i)}
+            analyzer.record_attacking_positions(i, positions)
+            time.sleep(0.5)
+        strategies, analysis = analyzer.generate_all_strategies()
+        print(f"\nGenerated {len(strategies)} strategies:")
+        for idx, strategy in enumerate(strategies, 1):
+            print(f"{idx}. {strategy['name']}")
+
+    elif args.compare:
+        print("Running Defense Comparison...")
+        comparator = DefenseComparator()
+        attacking_history = [
+            {'frame': i, 'positions': {1: (8+i, 25), 2: (25, 15), 3: (25, 35), 4: (45, 20), 5: (45, 30)}}
+            for i in range(5)
+        ]
+        actual_defense = {1: (15, 25), 2: (30, 18), 3: (30, 32), 4: (50, 22), 5: (50, 28)}
+        comparator.set_attacking_positions_history(attacking_history)
+        comparator.set_actual_defense(actual_defense)
+        comparator.generate_strategies()
+        _ = comparator.generate_comparison_report()
+
     else:
-        # Default: Run the full simulation
-        run_simulation()
+        custom_frames: Optional[List[Dict]] = None
+        if args.from_json:
+            custom_frames = load_custom_frames(args.from_json)
+        elif args.from_csv:
+            custom_frames = load_custom_frames(args.from_csv)
+
+        if args.agent or args.agent_llm:
+            run_agentic_simulation(custom_frames=custom_frames, use_llm=args.agent_llm)
+        else:
+            run_simulation(custom_frames=custom_frames)
